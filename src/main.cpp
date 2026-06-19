@@ -2,104 +2,136 @@
  * =============================================================
  * FILE: main.cpp
  * PROJECT: FreeRTOS-Edge-Gateway
- * MILESTONE: 3 — Queue-Based Inter-Task Communication
- * AUTHOR: senapathy
- * DATE: 14-06-2026
+ * MILESTONE: 4 — Hardware ISR Failsafe with FreeRTOS Semaphore
+ * AUTHOR: Senapathy
+ * DATE: 19-06-2026
  *
  * PURPOSE:
- *   Demonstrate thread-safe data passing between two FreeRTOS
- *   tasks using a Queue. This eliminates race conditions that
- *   occur when tasks share global variables directly.
+ *   Implement a hardware interrupt-driven failsafe system.
+ *   A physical button press triggers an ISR which signals
+ *   a FreeRTOS Binary Semaphore, instantly waking a dedicated
+ *   failsafe task that suspends all normal operations.
  *
- * ARCHITECTURE:
- *   taskSensor  (Priority 2) → generates data → xQueueSend()
- *   taskDisplay (Priority 1) → xQueueReceive() → prints data
  *
  * KEY CONCEPTS:
- *   - QueueHandle_t     : Handle to reference the queue
- *   - xQueueCreate()    : Create queue with size + item type
- *   - xQueueSend()      : Send data into queue (from producer)
- *   - xQueueReceive()   : Receive data from queue (consumer)
- *   - portMAX_DELAY     : Wait forever until data is available
+ *   - attachInterrupt()           : Register ISR with hardware
+ *   - IRAM_ATTR                   : Force ISR into fast RAM
+ *   - xSemaphoreCreateBinary()    : Create binary semaphore
+ *   - xSemaphoreGiveFromISR()     : Signal from ISR (non-blocking)
+ *   - xSemaphoreTake()            : Wait for signal in task
+ *   - vTaskSuspend()              : Freeze a task instantly
+ * =============================================================
  */
 
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"    // ← NEW: Queue API
+#include "freertos/queue.h"
+#include "freertos/semphr.h"       // ← NEW: Semaphore API
 
 
-#define LED_PIN             2
+#define LED_PIN             2      // Onboard LED
+#define BUTTON_PIN          4      // Emergency stop button
+#define FAILSAFE_LED_PIN    2      // Same LED, will blink SOS
 
 
-#define SENSOR_PERIOD_MS    1000   // Sensor reads every 1 second
-#define BLINK_PERIOD_MS     500    // LED blink every 500ms
+// TIMING
 
+#define SENSOR_PERIOD_MS    1000
+#define BLINK_PERIOD_MS     500
+#define FAILSAFE_BLINK_MS   200    // Fast blink = emergency state
+
+
+// QUEUE CONFIGURATION 
 
 #define QUEUE_LENGTH        5
 #define QUEUE_ITEM_SIZE     sizeof(int)
 
-// =============================================================
-// GLOBAL QUEUE HANDLE
-//   The QueueHandle_t  - is a REFERENCE to the
-//   queue infrastructure managed by the FreeRTOS kernel.
-//   Both tasks need this reference to find the same queue.
-//   The actual data inside the queue is kernel-managed and
-//   fully protected. This is safe. A raw shared int is not.
-// =============================================================
-QueueHandle_t xSensorQueue = NULL;
+
+// GLOBAL HANDLES
+
+QueueHandle_t  xSensorQueue    = NULL;
+SemaphoreHandle_t xEmergencySem = NULL;  // Binary semaphore
+
+TaskHandle_t   xSensorHandle   = NULL;   // For vTaskSuspend()
+TaskHandle_t   xDisplayHandle  = NULL;   // For vTaskSuspend()
+TaskHandle_t   xBlinkHandle    = NULL;   // For vTaskSuspend()
+
+
+// FORWARD DECLARATIONS
 
 void taskSensor(void* pvParameters);
 void taskDisplay(void* pvParameters);
 void taskBlink(void* pvParameters);
+void taskFailsafe(void* pvParameters);
+void IRAM_ATTR isrEmergencyButton();    // ISR declaration
 
 // =============================================================
-// setup() — Create Queue, Then Create Tasks - else error
+// setup()
 // =============================================================
 void setup() {
     Serial.begin(115200);
     delay(500);
 
     Serial.println("===========================================");
-    Serial.println("  FreeRTOS-Edge-Gateway | Milestone 3");
-    Serial.println("  Queue-Based Inter-Task Communication");
+    Serial.println("  FreeRTOS-Edge-Gateway | Milestone 4");
+    Serial.println("  Hardware ISR Failsafe System");
     Serial.println("===========================================");
 
     pinMode(LED_PIN, OUTPUT);
 
     // ==========================================================
-    // CREATE THE QUEUE — Before any tasks
-    //
-    // xQueueCreate(length, itemSize)
-    //   length   = max number of items queue can hold
-    //   itemSize = size of each item in bytes
-    //
-    // Returns NULL if creation fails (not enough heap memory).
-    // ALWAYS check for NULL — this is defensive programming,
-    // mandatory in automotive-grade code (MISRA-C Rule 17.7).
+    // BUTTON PIN CONFIGURATION
+    // INPUT_PULLUP activates the ESP32's internal pull-up
     // ==========================================================
-    
-    xSensorQueue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+    // ==========================================================
+    // ATTACH HARDWARE INTERRUPT
+    //
+    // attachInterrupt(pin, ISR_function, trigger_mode)
+    //
+    // FALLING means: trigger when signal goes HIGH → LOW
+    // ==========================================================
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN),
+                    isrEmergencyButton,
+                    FALLING);
+    Serial.println("[INIT] Emergency ISR attached | GPIO4 | FALLING edge");
+
+    // Create semaphore BEFORE tasks (same rule as queue)
+    xEmergencySem = xSemaphoreCreateBinary();
+    if (xEmergencySem == NULL) {
+        Serial.println("[FATAL] Semaphore creation failed! Halting.");
+        while(true);
+    }
+    Serial.println("[INIT] Emergency semaphore created");
+
+    // Create queue
+    xSensorQueue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
     if (xSensorQueue == NULL) {
         Serial.println("[FATAL] Queue creation failed! Halting.");
-        while(true); // Safe halt — never proceed without queue
+        while(true);
     }
-    Serial.println("[INIT] Sensor queue created | Length: 5 | Item: int");
+    Serial.println("[INIT] Sensor queue created");
 
-    // Create taskSensor — HIGH priority (producer)
-    xTaskCreate(taskSensor,  "TaskSensor",  2048, NULL, 2, NULL);
+    // ==========================================================
+    // CREATE TASKS 
+    // taskFailsafe gets HIGHEST priority (3)
+    // It must preempt everything when emergency occurs
+    // ==========================================================
+    xTaskCreate(taskFailsafe, "TaskFailsafe", 2048, NULL, 3, NULL);
+    Serial.println("[INIT] TaskFailsafe created | Priority: 3 (HIGHEST)");
+
+    xTaskCreate(taskSensor,  "TaskSensor",  2048, NULL, 2, &xSensorHandle);
     Serial.println("[INIT] TaskSensor  created | Priority: 2");
 
-    // Create taskDisplay — LOW priority (consumer)
-    xTaskCreate(taskDisplay, "TaskDisplay", 2048, NULL, 1, NULL);
+    xTaskCreate(taskDisplay, "TaskDisplay", 2048, NULL, 1, &xDisplayHandle);
     Serial.println("[INIT] TaskDisplay created | Priority: 1");
 
-    // Keep taskBlink running as before
-    xTaskCreate(taskBlink,   "TaskBlink",   2048, NULL, 1, NULL);
+    xTaskCreate(taskBlink,   "TaskBlink",   2048, NULL, 1, &xBlinkHandle);
     Serial.println("[INIT] TaskBlink   created | Priority: 1");
 
-    Serial.println("[INIT] All tasks running. Scheduler active.");
+    Serial.println("[INIT] System NOMINAL. Press button for emergency.");
     Serial.println("===========================================\n");
 }
 
@@ -108,78 +140,99 @@ void loop() {
 }
 
 // =============================================================
-// TASK 1: taskSensor — Data Producer
-// Priority: 2 (High)
+// ISR: isrEmergencyButton
 //
-// SIMULATES: An I2C sensor (like BME280 temperature sensor)
-//   In Milestone 4, this task will do real I2C reads.
-//   For now, we generate fake data to prove the Queue works.
+// IRAM_ATTR — CRITICAL KEYWORD:
+//   Normal code lives in Flash memory (slow).
+//   IRAM_ATTR forces this function into IRAM (Internal RAM)
+//   which is directly accessible by the CPU — much faster.
+//   ISRs MUST be in IRAM on ESP32, or the system will crash
+//   if the Flash cache is busy when the interrupt fires.
 //
-// xQueueSend(queue, &data, ticksToWait)
-//   &data        = pointer to the value we want to send
-//   portMAX_DELAY = wait forever if queue is full
-//   Returns pdPASS if sent successfully, errQUEUE_FULL if not
+// BaseType_t xHigherPriorityTaskWoken:
+//   FreeRTOS uses this to know if giving the semaphore
+//   woke up a higher priority task. If yes, we must
+//   explicitly yield so that task runs immediately.
+//   portYIELD_FROM_ISR() handles this context switch.
+// =============================================================
+void IRAM_ATTR isrEmergencyButton() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    // Signal the semaphore — wakes taskFailsafe
+    xSemaphoreGiveFromISR(xEmergencySem, &xHigherPriorityTaskWoken);
+
+    // If taskFailsafe has higher priority than current task,
+    // yield immediately so it runs without scheduler delay
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// =============================================================
+// TASK: taskFailsafe
+// Priority: 3 (HIGHEST)
+// =============================================================
+void taskFailsafe(void* pvParameters) {
+
+    while(true) {
+        
+        if (xSemaphoreTake(xEmergencySem, portMAX_DELAY) == pdTRUE) {
+
+            Serial.println("\n[!!!] EMERGENCY TRIGGERED [!!!]");
+            Serial.println("[FAILSAFE] ISR detected! Suspending all tasks.");
+
+            // Suspend all normal operation tasks instantly
+            vTaskSuspend(xSensorHandle);
+            vTaskSuspend(xDisplayHandle);
+            vTaskSuspend(xBlinkHandle);
+
+            Serial.println("[FAILSAFE] TaskSensor  → SUSPENDED");
+            Serial.println("[FAILSAFE] TaskDisplay → SUSPENDED");
+            Serial.println("[FAILSAFE] TaskBlink   → SUSPENDED");
+            Serial.println("[FAILSAFE] System in SAFE STATE");
+            Serial.println("[FAILSAFE] Fast blink = emergency indicator\n");
+
+            // Enter emergency state — fast LED blink forever
+            
+            while(true) {
+                digitalWrite(LED_PIN, HIGH);
+                vTaskDelay(pdMS_TO_TICKS(FAILSAFE_BLINK_MS));
+                digitalWrite(LED_PIN, LOW);
+                vTaskDelay(pdMS_TO_TICKS(FAILSAFE_BLINK_MS));
+            }
+        }
+    }
+}
+
+// =============================================================
+// TASK: taskSensor (same as Milestone 3)
 // =============================================================
 void taskSensor(void* pvParameters) {
     int sensorValue = 0;
-    BaseType_t queueStatus;
 
     while(true) {
-        // Simulate a sensor reading (0-100 range, cycling)
         sensorValue = (sensorValue + 5) % 101;
 
-        // Send to queue — thread-safe, atomic operation
-        queueStatus = xQueueSend(xSensorQueue, &sensorValue, portMAX_DELAY);
-
-        if (queueStatus == pdPASS) {
-            Serial.println("[SENSOR] Sent value: " + String(sensorValue)
-                         + " | Queue spaces left: "
-                         + String(uxQueueSpacesAvailable(xSensorQueue)));
-        } else {
-            Serial.println("[SENSOR] ERROR: Queue full! Data lost.");
-        }
+        xQueueSend(xSensorQueue, &sensorValue, portMAX_DELAY);
+        Serial.println("[SENSOR] Sent value: " + String(sensorValue));
 
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
 }
 
 // =============================================================
-// TASK 2: taskDisplay — Data Consumer
-// Priority: 1 (Low)
-//
-// SIMULATES: A display output task (OLED in Milestone 4)
-//
-// xQueueReceive(queue, &buffer, ticksToWait)
-//   &buffer      = where to store the received value
-//   portMAX_DELAY = BLOCK here until data arrives
-//
-// KEY INSIGHT — portMAX_DELAY here is POWERFUL:
-//   taskDisplay doesn't waste CPU polling "is data ready?"
-//   It sleeps completely until taskSensor puts something
-//   in the queue. The kernel wakes it up automatically.
-//   This is called "blocking on a queue" — zero CPU waste.
+// TASK: taskDisplay (same as Milestone 3)
 // =============================================================
 void taskDisplay(void* pvParameters) {
     int receivedValue = 0;
 
     while(true) {
-        // Block here until sensor data arrives — uses zero CPU
         if (xQueueReceive(xSensorQueue, &receivedValue, portMAX_DELAY) == pdPASS) {
-
-            Serial.println("-------------------------------------------");
-            Serial.println("[DISPLAY] New data received!");
-            Serial.println("[DISPLAY] Sensor Value : " + String(receivedValue));
-            Serial.println("[DISPLAY] Free Heap    : "
-                         + String(xPortGetFreeHeapSize()) + " bytes");
-            Serial.println("-------------------------------------------\n");
+            Serial.println("[DISPLAY] Sensor Value: " + String(receivedValue));
         }
     }
 }
 
 // =============================================================
-// TASK 3: taskBlink — Still running independently
-// Priority: 1
-// Proves that Queue communication doesn't affect other tasks
+// TASK: taskBlink (same as Milestone 3)
 // =============================================================
 void taskBlink(void* pvParameters) {
     while(true) {
